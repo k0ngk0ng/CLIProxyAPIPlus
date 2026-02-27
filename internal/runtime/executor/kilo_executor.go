@@ -20,11 +20,85 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+)
+
+const (
+	// kiloAPIBase is the base URL for the Kilo AI API.
+	kiloAPIBase = "https://api.kilo.ai"
+
+	// kiloUserAgent matches the User-Agent used by Kilo Code's official client.
+	kiloUserAgent = "opencode-kilo-provider"
+
+	// kiloEditorName is sent via X-KILOCODE-EDITORNAME to identify this client.
+	kiloEditorName = "Kilo CLI"
 )
 
 // KiloExecutor handles requests to Kilo API.
 type KiloExecutor struct {
 	cfg *config.Config
+}
+
+// kiloEndpoint returns the organization-aware API path for the given suffix
+// (e.g. "/chat/completions" or "/models").
+// When orgID is set, requests are routed through the organization-specific
+// endpoint; otherwise the default openrouter endpoint is used.
+func kiloEndpoint(orgID, suffix string) string {
+	if orgID != "" {
+		return "/api/organizations/" + orgID + suffix
+	}
+	return "/api/openrouter" + suffix
+}
+
+// stripKiloModelPrefix removes the "kilo/" provider prefix from a model ID
+// so that the upstream Kilo Gateway receives the OpenRouter-compatible model ID
+// (e.g. "kilo/anthropic/claude-opus-4-6" -> "anthropic/claude-opus-4-6").
+func stripKiloModelPrefix(model string) string {
+	if strings.HasPrefix(model, "kilo/") {
+		return model[len("kilo/"):]
+	}
+	return model
+}
+
+// applyKiloProviderOptions injects OpenRouter-compatible provider options into
+// the translated request payload. This matches the behavior of Kilo Code's
+// ProviderTransform.options() which sets:
+//   - reasoning.effort for Gemini 3 models
+//   - stream_options.include_usage for streaming usage tracking
+//
+// The "reasoning" field is an OpenRouter top-level parameter (not nested under
+// "provider") that controls how reasoning models allocate thinking tokens.
+func applyKiloProviderOptions(payload []byte, model string, stream bool) []byte {
+	modelLower := strings.ToLower(model)
+
+	// Set stream_options.include_usage for streaming requests.
+	// Although OpenRouter now includes usage automatically, this keeps parity
+	// with the official client and is harmless if redundant.
+	if stream {
+		if !gjson.GetBytes(payload, "stream_options.include_usage").Exists() {
+			payload, _ = sjson.SetBytes(payload, "stream_options.include_usage", true)
+		}
+	}
+
+	// Gemini 3 models default to high reasoning effort in Kilo Code.
+	if strings.Contains(modelLower, "gemini-3") {
+		if !gjson.GetBytes(payload, "reasoning.effort").Exists() {
+			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "high")
+		}
+	}
+
+	return payload
+}
+
+// setKiloHeaders sets the standard Kilo Gateway headers on an HTTP request.
+func setKiloHeaders(req *http.Request, accessToken, orgID string) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", kiloUserAgent)
+	req.Header.Set("X-KILOCODE-EDITORNAME", kiloEditorName)
+	if orgID != "" {
+		req.Header.Set("X-KILOCODE-ORGANIZATIONID", orgID)
+	}
 }
 
 // NewKiloExecutor creates a new Kilo executor instance.
@@ -40,12 +114,12 @@ func (e *KiloExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth
 	if req == nil {
 		return nil
 	}
-	accessToken, _ := kiloCredentials(auth)
+	accessToken, orgID := kiloCredentials(auth)
 	if strings.TrimSpace(accessToken) == "" {
 		return fmt.Errorf("kilo: missing access token")
 	}
 
-	req.Header.Set("Authorization", "Bearer "+accessToken)
+	setKiloHeaders(req, accessToken, orgID)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -72,7 +146,7 @@ func (e *KiloExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 
 // Execute performs a non-streaming request.
 func (e *KiloExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := stripKiloModelPrefix(thinking.ParseSuffix(req.Model).ModelName)
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.trackFailure(ctx, &err)
@@ -84,7 +158,6 @@ func (e *KiloExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
-	endpoint := "/api/openrouter/chat/completions"
 
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -101,17 +174,14 @@ func (e *KiloExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 
-	url := "https://api.kilo.ai" + endpoint
+	translated = applyKiloProviderOptions(translated, baseModel, opts.Stream)
+
+	url := kiloAPIBase + kiloEndpoint(orgID, "/chat/completions")
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return resp, err
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+accessToken)
-	if orgID != "" {
-		httpReq.Header.Set("X-Kilocode-OrganizationID", orgID)
-	}
-	httpReq.Header.Set("User-Agent", "cli-proxy-kilo")
+	setKiloHeaders(httpReq, accessToken, orgID)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -169,7 +239,7 @@ func (e *KiloExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 // ExecuteStream performs a streaming request.
 func (e *KiloExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := stripKiloModelPrefix(thinking.ParseSuffix(req.Model).ModelName)
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.trackFailure(ctx, &err)
@@ -181,7 +251,6 @@ func (e *KiloExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
-	endpoint := "/api/openrouter/chat/completions"
 
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -198,17 +267,14 @@ func (e *KiloExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 
-	url := "https://api.kilo.ai" + endpoint
+	translated = applyKiloProviderOptions(translated, baseModel, true)
+
+	url := kiloAPIBase + kiloEndpoint(orgID, "/chat/completions")
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+accessToken)
-	if orgID != "" {
-		httpReq.Header.Set("X-Kilocode-OrganizationID", orgID)
-	}
-	httpReq.Header.Set("User-Agent", "cli-proxy-kilo")
+	setKiloHeaders(httpReq, accessToken, orgID)
 	httpReq.Header.Set("Accept", "text/event-stream")
 	httpReq.Header.Set("Cache-Control", "no-cache")
 
@@ -346,6 +412,8 @@ func kiloCredentials(auth *cliproxyauth.Auth) (accessToken, orgID string) {
 }
 
 // FetchKiloModels fetches models from Kilo API.
+// All models returned by the API are included (both free and paid) so that
+// authenticated users can access models like anthropic/claude-opus-4-6.
 func FetchKiloModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.Config) []*registry.ModelInfo {
 	accessToken, orgID := kiloCredentials(auth)
 	if accessToken == "" {
@@ -355,18 +423,21 @@ func FetchKiloModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.C
 
 	log.Debugf("kilo: fetching dynamic models (orgID: %s)", orgID)
 
+	modelsURL := kiloAPIBase + kiloEndpoint(orgID, "/models")
+
 	httpClient := newProxyAwareHTTPClient(ctx, cfg, auth, 0)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.kilo.ai/api/openrouter/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
 	if err != nil {
 		log.Warnf("kilo: failed to create model fetch request: %v", err)
 		return registry.GetKiloModels()
 	}
 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", kiloUserAgent)
+	req.Header.Set("X-KILOCODE-EDITORNAME", kiloEditorName)
 	if orgID != "" {
-		req.Header.Set("X-Kilocode-OrganizationID", orgID)
+		req.Header.Set("X-KILOCODE-ORGANIZATIONID", orgID)
 	}
-	req.Header.Set("User-Agent", "cli-proxy-kilo")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -409,47 +480,68 @@ func FetchKiloModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.C
 	result.ForEach(func(key, value gjson.Result) bool {
 		totalCount++
 		id := value.Get("id").String()
-		pIdxResult := value.Get("preferredIndex")
-		preferredIndex := pIdxResult.Int()
-
-		// Filter models where preferredIndex > 0 (Kilo-curated models)
-		if preferredIndex <= 0 {
+		if id == "" {
 			return true
 		}
 
-		// Check if it's free. We look for :free suffix, is_free flag, or zero pricing.
-		isFree := strings.HasSuffix(id, ":free") || id == "giga-potato" || value.Get("is_free").Bool()
-		if !isFree {
-			// Check pricing as fallback
-			promptPricing := value.Get("pricing.prompt").String()
-			if promptPricing == "0" || promptPricing == "0.0" {
-				isFree = true
+		contextLength := int(value.Get("context_length").Int())
+		maxTokens := int(value.Get("top_provider.max_completion_tokens").Int())
+		displayName := value.Get("name").String()
+
+		model := &registry.ModelInfo{
+			ID:                  id,
+			DisplayName:         displayName,
+			ContextLength:       contextLength,
+			MaxCompletionTokens: maxTokens,
+			OwnedBy:             "kilo",
+			Type:                "kilo",
+			Object:              "model",
+			Created:             now,
+		}
+
+		// Detect thinking/reasoning support based on model family.
+		// Kilo Code's ProviderTransform.variants() enables OpenRouter reasoning
+		// effort levels ("none","minimal","low","medium","high","xhigh") for
+		// GPT, Claude, and Gemini 3 model families. Adaptive Anthropic models
+		// (opus-4-6/4.6, sonnet-4-6/4.6) additionally support budget-based
+		// thinking with dynamic allocation.
+		idLower := strings.ToLower(id)
+		isAdaptiveAnthropic := strings.Contains(idLower, "opus-4-6") || strings.Contains(idLower, "opus-4.6") ||
+			strings.Contains(idLower, "sonnet-4-6") || strings.Contains(idLower, "sonnet-4.6")
+		isClaudeThinking := isAdaptiveAnthropic ||
+			strings.Contains(idLower, "opus-4-5") || strings.Contains(idLower, "opus-4.5") ||
+			strings.Contains(idLower, "sonnet-4-5") || strings.Contains(idLower, "sonnet-4.5") ||
+			strings.Contains(idLower, "claude")
+		isGPT := strings.Contains(idLower, "gpt-")
+		isGemini3 := strings.Contains(idLower, "gemini-3")
+
+		if isAdaptiveAnthropic {
+			// Adaptive Anthropic models support both effort levels and
+			// budget-based thinking (min/max token range).
+			model.Thinking = &registry.ThinkingSupport{
+				Min:            1024,
+				Max:            32000,
+				ZeroAllowed:    true,
+				DynamicAllowed: true,
+				Levels:         []string{"none", "minimal", "low", "medium", "high", "xhigh"},
+			}
+		} else if isClaudeThinking || isGPT || isGemini3 {
+			// Other reasoning models support discrete effort levels via
+			// OpenRouter's reasoning.effort parameter.
+			model.Thinking = &registry.ThinkingSupport{
+				Levels: []string{"none", "minimal", "low", "medium", "high", "xhigh"},
 			}
 		}
 
-		if !isFree {
-			log.Debugf("kilo: skipping curated paid model: %s", id)
-			return true
-		}
-
-		log.Debugf("kilo: found curated model: %s (preferredIndex: %d)", id, preferredIndex)
-
-		dynamicModels = append(dynamicModels, &registry.ModelInfo{
-			ID:            id,
-			DisplayName:   value.Get("name").String(),
-			ContextLength: int(value.Get("context_length").Int()),
-			OwnedBy:       "kilo",
-			Type:          "kilo",
-			Object:        "model",
-			Created:       now,
-		})
+		dynamicModels = append(dynamicModels, model)
 		count++
+		log.Debugf("kilo: found model: %s", id)
 		return true
 	})
 
-	log.Infof("kilo: fetched %d models from API, %d curated free (preferredIndex > 0)", totalCount, count)
+	log.Infof("kilo: fetched %d models from API, %d included", totalCount, count)
 	if count == 0 && totalCount > 0 {
-		log.Warn("kilo: no curated free models found (check API response fields)")
+		log.Warn("kilo: no models found in API response (check response format)")
 	}
 
 	staticModels := registry.GetKiloModels()
