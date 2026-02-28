@@ -43,24 +43,24 @@ func TestResolveOAuthUpstreamModel_SuffixPreservation(t *testing.T) {
 			input:   "gemini-2.5-pro",
 			want:    "gemini-2.5-pro-exp-03-25",
 		},
-			{
-				name: "kiro alias resolves",
-				aliases: map[string][]internalconfig.OAuthModelAlias{
-					"kiro": {{Name: "kiro-claude-sonnet-4-5", Alias: "sonnet"}},
-				},
-				channel: "kiro",
-				input:   "sonnet",
-				want:    "kiro-claude-sonnet-4-5",
+		{
+			name: "kiro alias resolves",
+			aliases: map[string][]internalconfig.OAuthModelAlias{
+				"kiro": {{Name: "kiro-claude-sonnet-4-5", Alias: "sonnet"}},
 			},
-			{
-				name: "kilo alias resolves",
-				aliases: map[string][]internalconfig.OAuthModelAlias{
-					"kilo": {{Name: "anthropic/claude-opus-4.6", Alias: "claude-opus"}},
-				},
-				channel: "kilo",
-				input:   "claude-opus(high)",
-				want:    "anthropic/claude-opus-4.6(high)",
+			channel: "kiro",
+			input:   "sonnet",
+			want:    "kiro-claude-sonnet-4-5",
+		},
+		{
+			name: "kilo alias resolves",
+			aliases: map[string][]internalconfig.OAuthModelAlias{
+				"kilo": {{Name: "anthropic/claude-opus-4.6", Alias: "claude-opus"}},
 			},
+			channel: "kilo",
+			input:   "claude-opus(high)",
+			want:    "anthropic/claude-opus-4.6(high)",
+		},
 		{
 			name: "config suffix takes priority",
 			aliases: map[string][]internalconfig.OAuthModelAlias{
