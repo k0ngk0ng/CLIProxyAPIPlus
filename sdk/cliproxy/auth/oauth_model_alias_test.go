@@ -43,15 +43,24 @@ func TestResolveOAuthUpstreamModel_SuffixPreservation(t *testing.T) {
 			input:   "gemini-2.5-pro",
 			want:    "gemini-2.5-pro-exp-03-25",
 		},
-		{
-			name: "kiro alias resolves",
-			aliases: map[string][]internalconfig.OAuthModelAlias{
-				"kiro": {{Name: "kiro-claude-sonnet-4-5", Alias: "sonnet"}},
+			{
+				name: "kiro alias resolves",
+				aliases: map[string][]internalconfig.OAuthModelAlias{
+					"kiro": {{Name: "kiro-claude-sonnet-4-5", Alias: "sonnet"}},
+				},
+				channel: "kiro",
+				input:   "sonnet",
+				want:    "kiro-claude-sonnet-4-5",
 			},
-			channel: "kiro",
-			input:   "sonnet",
-			want:    "kiro-claude-sonnet-4-5",
-		},
+			{
+				name: "kilo alias resolves",
+				aliases: map[string][]internalconfig.OAuthModelAlias{
+					"kilo": {{Name: "anthropic/claude-opus-4.6", Alias: "claude-opus"}},
+				},
+				channel: "kilo",
+				input:   "claude-opus(high)",
+				want:    "anthropic/claude-opus-4.6(high)",
+			},
 		{
 			name: "config suffix takes priority",
 			aliases: map[string][]internalconfig.OAuthModelAlias{
@@ -192,6 +201,8 @@ func createAuthForChannel(channel string) *Auth {
 		return &Auth{Provider: "kimi"}
 	case "kiro":
 		return &Auth{Provider: "kiro"}
+	case "kilo":
+		return &Auth{Provider: "kilo"}
 	case "github-copilot":
 		return &Auth{Provider: "github-copilot"}
 	default:
@@ -220,6 +231,14 @@ func TestOAuthModelAliasChannel_Kiro(t *testing.T) {
 
 	if got := OAuthModelAliasChannel("kiro", ""); got != "kiro" {
 		t.Fatalf("OAuthModelAliasChannel() = %q, want %q", got, "kiro")
+	}
+}
+
+func TestOAuthModelAliasChannel_Kilo(t *testing.T) {
+	t.Parallel()
+
+	if got := OAuthModelAliasChannel("kilo", ""); got != "kilo" {
+		t.Fatalf("OAuthModelAliasChannel() = %q, want %q", got, "kilo")
 	}
 }
 
