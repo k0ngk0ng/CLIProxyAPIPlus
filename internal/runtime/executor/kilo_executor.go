@@ -50,10 +50,15 @@ func kiloEndpoint(suffix string) string {
 // so that the upstream Kilo Gateway receives the OpenRouter-compatible model ID
 // (e.g. "kilo/anthropic/claude-opus-4-6" -> "anthropic/claude-opus-4-6").
 func stripKiloModelPrefix(model string) string {
-	if strings.HasPrefix(model, "kilo/") {
-		return model[len("kilo/"):]
+	trimmed := strings.TrimSpace(model)
+	// Keep Kilo built-in auto models unchanged. These are valid upstream model IDs.
+	if strings.EqualFold(trimmed, "kilo/auto") || strings.EqualFold(trimmed, "kilo/auto-free") {
+		return trimmed
 	}
-	return model
+	if strings.HasPrefix(trimmed, "kilo/") {
+		return trimmed[len("kilo/"):]
+	}
+	return trimmed
 }
 
 // applyKiloProviderOptions injects OpenRouter-compatible provider options into
