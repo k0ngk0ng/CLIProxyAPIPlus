@@ -39,15 +39,11 @@ type KiloExecutor struct {
 	cfg *config.Config
 }
 
-// kiloEndpoint returns the organization-aware API path for the given suffix
+// kiloEndpoint returns the Kilo Gateway API path for the given suffix
 // (e.g. "/chat/completions" or "/models").
-// When orgID is set, requests are routed through the organization-specific
-// endpoint; otherwise the default openrouter endpoint is used.
-func kiloEndpoint(orgID, suffix string) string {
-	if orgID != "" {
-		return "/api/organizations/" + orgID + suffix
-	}
-	return "/api/openrouter" + suffix
+// Kilo Gateway is exposed under /api/gateway.
+func kiloEndpoint(suffix string) string {
+	return "/api/gateway" + suffix
 }
 
 // stripKiloModelPrefix removes the "kilo/" provider prefix from a model ID
@@ -176,7 +172,7 @@ func (e *KiloExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	translated = applyKiloProviderOptions(translated, baseModel, opts.Stream)
 
-	url := kiloAPIBase + kiloEndpoint(orgID, "/chat/completions")
+	url := kiloAPIBase + kiloEndpoint("/chat/completions")
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return resp, err
@@ -269,7 +265,7 @@ func (e *KiloExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 	translated = applyKiloProviderOptions(translated, baseModel, true)
 
-	url := kiloAPIBase + kiloEndpoint(orgID, "/chat/completions")
+	url := kiloAPIBase + kiloEndpoint("/chat/completions")
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
@@ -412,8 +408,9 @@ func kiloCredentials(auth *cliproxyauth.Auth) (accessToken, orgID string) {
 }
 
 // FetchKiloModels fetches models from Kilo API.
-// All models returned by the API are included (both free and paid) so that
-// authenticated users can access models like anthropic/claude-opus-4-6.
+// Only curated free models are included:
+//   - preferredIndex > 0
+//   - free model marker (":free", is_free=true, or zero prompt pricing)
 func FetchKiloModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.Config) []*registry.ModelInfo {
 	accessToken, orgID := kiloCredentials(auth)
 	if accessToken == "" {
@@ -423,7 +420,7 @@ func FetchKiloModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.C
 
 	log.Debugf("kilo: fetching dynamic models (orgID: %s)", orgID)
 
-	modelsURL := kiloAPIBase + kiloEndpoint(orgID, "/models")
+	modelsURL := kiloAPIBase + kiloEndpoint("/models")
 
 	httpClient := newProxyAwareHTTPClient(ctx, cfg, auth, 0)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
@@ -483,6 +480,21 @@ func FetchKiloModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.C
 		if id == "" {
 			return true
 		}
+		preferredIndex := value.Get("preferredIndex").Int()
+		if preferredIndex <= 0 {
+			return true
+		}
+		isFree := strings.HasSuffix(id, ":free") || id == "giga-potato" || value.Get("is_free").Bool()
+		if !isFree {
+			promptPricing := value.Get("pricing.prompt").String()
+			if promptPricing == "0" || promptPricing == "0.0" {
+				isFree = true
+			}
+		}
+		if !isFree {
+			log.Debugf("kilo: skipping curated paid model: %s", id)
+			return true
+		}
 
 		contextLength := int(value.Get("context_length").Int())
 		maxTokens := int(value.Get("top_provider.max_completion_tokens").Int())
@@ -535,13 +547,13 @@ func FetchKiloModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.C
 
 		dynamicModels = append(dynamicModels, model)
 		count++
-		log.Debugf("kilo: found model: %s", id)
+		log.Debugf("kilo: found curated free model: %s (preferredIndex: %d)", id, preferredIndex)
 		return true
 	})
 
-	log.Infof("kilo: fetched %d models from API, %d included", totalCount, count)
+	log.Infof("kilo: fetched %d models from API, %d curated free (preferredIndex > 0)", totalCount, count)
 	if count == 0 && totalCount > 0 {
-		log.Warn("kilo: no models found in API response (check response format)")
+		log.Warn("kilo: no curated free models found (check API response fields)")
 	}
 
 	staticModels := registry.GetKiloModels()
