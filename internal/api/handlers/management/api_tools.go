@@ -305,6 +305,12 @@ func tokenValueForAuth(auth *coreauth.Auth) string {
 			return v
 		}
 	}
+	// Check for kilo token in metadata (kilocodeToken field)
+	if auth.Provider == "kilo" && auth.Metadata != nil {
+		if v, ok := auth.Metadata["kilocodeToken"].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
 	if shared := geminicli.ResolveSharedCredential(auth.Runtime); shared != nil {
 		if v := tokenValueFromMetadata(shared.MetadataSnapshot()); v != "" {
 			return v
