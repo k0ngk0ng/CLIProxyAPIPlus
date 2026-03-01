@@ -562,8 +562,8 @@ func FetchKiloModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.C
 	}
 
 	staticModels := registry.GetKiloModels()
-	// Always include kilo/auto (first static model)
-	allModels := append(staticModels[:1], dynamicModels...)
+	// Include all static models (kilo/auto, anthropic/claude-opus-4-6, etc.) plus dynamic models
+	allModels := append(staticModels, dynamicModels...)
 
 	return allModels
 }
